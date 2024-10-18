@@ -17,5 +17,5 @@ The these break the list of shots into threads chunks and distribute the work us
 
 There is a python function `drop_caches.py` which can be placed in the MDS_PATH of the server being connected to.  With sufficent passwordless sudo priveledges it will cause the server to flush its file system caches.
 
-There is a directory with the HDF files that the benchmark is looking for.
+I directory with the HDF files the benchmark is looking for needs to be created, and the h5open needs to be updated to point to it.
 
