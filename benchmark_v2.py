@@ -1,13 +1,27 @@
 #!/usr/bin/env python
 import sys
 import time
-import random
-import MDSplus
 # from mdsthin import MDSplus
-import matplotlib.pyplot as plt
 import numpy as np
 from multiprocessing import Pool
-all_shots = [int(line.rstrip()) for line in open('disruption_warnings_all_shots.csv')]
+
+USE_PSFC = False
+CHUNKS_PER_PAGE = 8
+MAX_THREADS = 16
+
+if USE_PSFC:
+    shotlist_filename = "disruption_warnings_all_shots.csv"
+    data_dir = "/home/jas/benchmarks"
+    ext = ".hdf5"
+else:
+    # for AWS
+    shotlist_filename = "aws_all_shots.csv"
+    # data_dir = "/home/ec2-user/data/cmod"  # local posix
+    data_dir = "s3://psfchdf5/cmod"
+    # data_dir = "hdf5://cmodh5"
+    ext = ".h5"
+
+all_shots = [int(line.rstrip()) for line in open(shotlist_filename)]
 
 class SigObj:
    def __init__(self, sig_name, tree, signal):
@@ -99,9 +113,26 @@ signals = [
 
 def hdf_bench(shots, sigs):
     import h5py
+    if data_dir.startswith("s3://"):
+        import s3fs
+        # use s3fs for access HDF5 files
+        s3 = s3fs.S3FileSystem()
+    else:
+        s3 = None
+
     for shot in shots:
+        filepath = f'{data_dir}/{shot}{ext}'
+        if s3:
+            filepath = s3.open(filepath, 'rb') 
+        elif filepath.startswith("hdf5://"):
+            from h5pyd import H5Image
+            # HDF5 file image, open with h5py and H5Image
+            filepath = H5Image(filepath, chunks_per_page=CHUNKS_PER_PAGE)
+        else:
+            pass  # regular h5py read
+
         try:
-            with h5py.File(f'/home/jas/benchmarks/hdf/{shot}.hdf5', 'r') as f:
+            with h5py.File(filepath) as f:
                 for s in sigs:
                     try:
                         y = f[s.signal][:]
@@ -129,6 +160,7 @@ def distributed_bench(shots, sigs):
             print(f'error opening shot {shot}\n{e}')
 
 def thin_bench(shots, sigs):
+    import MDSplus
     c = MDSplus.Connection('alcdata-archives')
     dummy = c.get('setenv("PyLib=python2.7")')
     dummy = c.get('shorten_path()')
@@ -144,6 +176,7 @@ def thin_bench(shots, sigs):
                 pass
 
 def gm_bench(shots, sigs):
+    import MDSplus
     c = MDSplus.Connection('alcdata-archives')
     dummy = c.get('setenv("PyLib=python2.7")')
     dummy = c.get('shorten_path()')
@@ -161,15 +194,12 @@ def gm_bench(shots, sigs):
                 print(f'could not read {s.signal} from {shot}')
                 print(e)
 
-import numpy as np
-import time
-from multiprocessing import Pool
-
 # Function to handle the parallel execution of a benchmark function
 def run_benchmark(benchmark_func, shots, sigs, threads):
     # Handle edge case where number of threads exceeds available data
     chunk_size = len(shots) // threads
     remainder = len(shots) % threads
+    num_shots = len(shots)
 
     # Adjust the size of the array if the remainder is not zero
     if remainder != 0:
@@ -185,17 +215,55 @@ def run_benchmark(benchmark_func, shots, sigs, threads):
         results = pool.starmap(benchmark_func, [(chunk, sigs) for chunk in shot_chunks])
 
     # Print the benchmark result
-    print(f'{benchmark_func.__name__} benchmark completed in {time.time() - start_time:.4f} seconds')
+    # print(f'{benchmark_func.__name__} benchmark completed in {time.time() - start_time:.4f} seconds')
+    print(f'{benchmark_func.__name__} {num_shots:10d} {len(signals):10d}    {threads:10d}    {time.time() - start_time:.4f}')
     return results
 
 
 # Main benchmark routine that takes a function to call
-def benchmark_routine(benchmark_func, shots, sigs, threads):
-    print(f'Running {benchmark_func.__name__} with {threads} threads')
-    run_benchmark(benchmark_func, shots, sigs, threads)
+def benchmark_routine(benchmark_func, num_shots=None, num_signals=None, num_threads=None):
+    shots = all_shots[:num_shots]
+    sigs = signals[:num_signals]
+        
+    if benchmark == "thin":
+        run_benchmark(thin_bench, shots, sigs, num_threads)
+    elif benchmark == "gm":
+        run_benchmark(gm_bench, shots, sigs, num_threads)
+    elif benchmark == "hdf":
+        run_benchmark(hdf_bench, shots, sigs, num_threads)
+    else:
+        sys.exit(1)  # this should be checked in the main routine
+    
 
 # Example usage
 if __name__ == '__main__':
 
-    benchmark_routine(thin_bench, all_shots[0:100], signals[0:20], threads=4)
-    benchmark_routine(gm_bench, all_shots[0:100], signals[0:20], threads=4)
+    usage = f"Usage: python {sys.argv[0]} [thin|gm|hdf] [num_shots] [num_threads]\n"
+    usage += f"Example: python {sys.argv[0]} hdf 100 20 4"
+
+    if len(sys.argv) < 3:
+        sys.exit(usage)
+    
+    benchmark = sys.argv[1]
+    if benchmark not in ("thin", "gm", "hdf"):
+        sys.exit(usage)
+
+    num_shots = int(sys.argv[2])
+    if len(sys.argv) < 4:
+        num_threads = None
+    else:
+        num_threads = int(sys.argv[3])
+    
+    num_signals = 20 # this does't seem to have any effect!
+
+    if num_threads:
+        benchmark_routine(benchmark, num_shots=num_shots, num_signals=num_signals, num_threads=num_threads)
+    else:
+        # iterate for 1 through max_threads
+
+        print("BENCHMARK  NUM_SHOTS   NUM_SIGNALS  NUM_THREADS  TIME (sec)")
+        for n in range(MAX_THREADS):
+            num_threads = n + 1
+            benchmark_routine(benchmark, num_shots=num_shots, num_signals=num_signals, num_threads=num_threads)
+
+    
