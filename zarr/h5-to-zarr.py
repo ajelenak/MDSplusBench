@@ -5,10 +5,13 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tomllib
 from urllib.parse import urlparse
 
+from dask.distributed import Client, LocalCluster, as_completed
 import fsspec
 import h5py
+import numcodecs
 import numpy as np
 import obstore
 from obstore.store import LocalStore, S3Store
@@ -30,39 +33,112 @@ lggr = logging.getLogger(Path(__file__).stem)
 
 
 def parse_cli() -> argparse.Namespace:
-    """Deal with command-line arguments."""
+    """Deal with command-line arguments. Defaults are suppressed to detect actual user input."""
     parser = argparse.ArgumentParser(
-        description="Convert HDF5 files to Zarr v3 stores using fsspec and obstore.",
+        description="Convert HDF5 files to Zarr using a strict TOML config with allowed CLI overrides.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+
+    # Required config file
     parser.add_argument(
-        "input_uri",
-        help="Folder or S3 bucket URI containing source HDF5 files (e.g., s3://bucket/data or ./data)",
+        "--config",
         type=str,
+        help="Path to the TOML configuration file.",
+        default="./h5-to-zarr.toml",
+    )
+
+    # CLI-exclusive flags...
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Perform a dry run to test configurations and file discovery without converting",
+    )
+
+    # Dask worker argument. Default is 90% of reported CPUs (minimum 1).
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, int((os.cpu_count() or 1) * 0.9)),
+        help="Number of Dask workers to spin up. One process per worker, no threads.",
+    )
+
+    # Suppressed overrides...
+    parser.add_argument(
+        "--input-uri", type=str, default=argparse.SUPPRESS, help="Override input URI"
     )
     parser.add_argument(
-        "output_uri", help="Folder or S3 bucket URI for output Zarr stores", type=str
+        "--output-uri", type=str, default=argparse.SUPPRESS, help="Override output URI"
     )
     parser.add_argument(
         "--loglevel",
         type=str,
         choices=["debug", "info", "warning", "error"],
-        default="info",
-        help="Logging level",
+        default=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "-M",
+        "--zarr-version", type=int, choices=[2, 3], default=argparse.SUPPRESS
+    )
+
+    # Boolean overrides (Generates both --flag and --no-flag)...
+    parser.add_argument(
+        "--use-shards", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS
+    )
+    parser.add_argument(
         "--consolidate-metadata",
-        action="store_true",
-        help="Consolidate Zarr store metadata",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
     )
-    parser.add_argument(
-        "-S",
-        "--use-shards",
-        action="store_true",
-        help="Enable storing Zarr chunks into shards",
-    )
+
     return parser.parse_args()
+
+
+def load_and_merge_config(cli_args: argparse.Namespace) -> argparse.Namespace:
+    """Reads TOML, applies permitted CLI overrides, and returns a unified config namespace."""
+    with open(cli_args.config, "rb") as f:
+        toml_data = tomllib.load(f)
+
+    # Map the CLI argument names to their [section] and [key] in the TOML file...
+    param_map = {
+        "input_uri": ("paths", "input_uri"),
+        "output_uri": ("paths", "output_uri"),
+        "zarr_version": ("zarr", "version"),
+        "use_shards": ("zarr", "use_shards"),
+        "consolidate_metadata": ("zarr", "consolidate_metadata"),
+        "loglevel": ("logging", "level"),
+    }
+
+    final_config = argparse.Namespace()
+
+    for cli_key, (toml_sec, toml_key) in param_map.items():
+        # Fetch the entry; default to an empty dict if malformed...
+        entry = toml_data.get(toml_sec, {}).get(toml_key)
+        if entry is None or "value" not in entry:
+            raise ValueError(
+                f"Invalid TOML config: Missing '{toml_sec}.{toml_key}.value'"
+            )
+
+        val = entry["value"]
+        allow_override = entry.get("allow_override", False)
+
+        # 3-Way Check: Did the user type this flag?
+        if hasattr(cli_args, cli_key):
+            cli_val = getattr(cli_args, cli_key)
+            if not allow_override:
+                raise PermissionError(
+                    f"Cannot override '{toml_key}'. Check your TOML config."
+                )
+
+            lggr.info(f"Overriding config '{toml_key}' -> '{cli_val}'")
+            val = cli_val
+
+        # Set the resolved value on our final config namespace...
+        setattr(final_config, cli_key, val)
+
+    # Pass through CLI-exclusive flags...
+    setattr(final_config, "dry_run", getattr(cli_args, "dry_run", False))
+    setattr(final_config, "workers", getattr(cli_args, "workers"))
+
+    return final_config
 
 
 def get_file_list(uri: str) -> list[str]:
@@ -136,10 +212,6 @@ def get_s3_config() -> dict[str, str]:
         "AWS_SECRET_ACCESS_KEY",
         creds.get(profile, "aws_secret_access_key", fallback=""),
     )
-    # s3p["session_token"] = os.getenv(
-    #     "AWS_SESSION_TOKEN",
-    #     creds.get(profile, "aws_session_token", fallback=""),
-    # )
     s3p["region"] = os.getenv("AWS_REGION", config.get(profile, "region"))
 
     return s3p
@@ -244,7 +316,7 @@ def copy_attributes(
 
 
 def process_dataset(
-    name: str, h5dset: h5py.Dataset, zarr_group: zarr.Group, **kwargs
+    name: str, h5dset: h5py.Dataset, zarr_group: zarr.Group, config: argparse.Namespace
 ) -> None:
     """
     Reads HDF5 dataset and creates equivalent Zarr array.
@@ -253,49 +325,63 @@ def process_dataset(
     comp = h5dset.compression
     if comp is not None and comp not in ["gzip", "deflate"]:
         raise ValueError(
-            f"Unsupported compression '{comp}' in dataset '{h5dset.name}'. "
-            "Only 'gzip' (DEFLATE) is allowed."
+            f"Unsupported compression '{comp}' in dataset '{h5dset.name}'. Only 'gzip' is allowed."
         )
 
-    # Determine chunks and compressor...
+    # Determine chunks, shards, and compressor based on target Zarr version...
     shards = None
+    filters = None
+
     if h5dset.chunks is None:
         chunks = h5dset.shape
         compressor = None
-        lggr.debug(
-            f"Dataset '{h5dset.name}' is contiguous. Using single chunk {chunks} and no compression."
-        )
     else:
         chunks = h5dset.chunks
         level = h5dset.compression_opts if h5dset.compression_opts is not None else 1
-        compressor = GZip(level=level)
 
-        if kwargs.get("use_shards", False):
-            num_chunks = h5dset.id.get_num_chunks()
-            if num_chunks > 1:
-                expanse = (num_chunks,) * len(chunks)  # placeholder for future
-                shards = tuple(_[0] * _[1] for _ in zip(chunks, expanse))
+        if config.zarr_version == 3:
+            compressor = GZip(level=level)
+            if config.use_shards:
+                num_chunks = h5dset.id.get_num_chunks()
+                if num_chunks > 1:
+                    expanse = (num_chunks,) * len(chunks)
+                    shards = tuple(_[0] * _[1] for _ in zip(chunks, expanse))
+        else:
+            # Zarr v2 uses the standard numcodecs implementation
+            compressor = numcodecs.GZip(level=level)
 
     # Create Zarr array...
     h5dtype = h5dset.dtype
     if h5dtype.kind == "O" and h5py.check_vlen_dtype(h5dtype):
         # Variable-length strings case...
         zdtype = str
+        if config.zarr_version == 2:
+            filters = [numcodecs.VLenUTF8()]
     else:
         zdtype = h5dtype
-    zarr_arr = zarr_group.create_array(
-        name=name,
-        shape=h5dset.shape,
-        dtype=zdtype,
-        chunks=chunks,
-        shards=shards,
-        compressors=compressor,
-        overwrite=True,
-    )
+
+    # Structure keyword arguments specifically tailored for the target Zarr format API
+    create_kwargs = {
+        "name": name,
+        "shape": h5dset.shape,
+        "dtype": zdtype,
+        "chunks": chunks,
+        "overwrite": True,
+    }
+
+    if config.zarr_version == 3:
+        create_kwargs["compressors"] = compressor
+        create_kwargs["shards"] = shards
+    else:
+        create_kwargs["compressor"] = compressor
+        if filters is not None:
+            create_kwargs["filters"] = filters
+
+    zarr_arr = zarr_group.create_array(**create_kwargs)
 
     # Transfer data...
     if h5dset.shape == ():
-        zarr_arr[()] = h5dset[()]  # scalar HDF5 dataset
+        zarr_arr[()] = h5dset[()]
     else:
         zarr_arr[:] = h5dset[:]
 
@@ -306,35 +392,35 @@ def process_dataset(
         zarr_arr.attrs["_ARRAY_DIMENSIONS"] = dim_names
 
 
-def process_group(h5_group: h5py.Group, zarr_group: zarr.Group, **kwargs) -> None:
+def process_group(
+    h5_group: h5py.Group, zarr_group: zarr.Group, config: argparse.Namespace
+) -> None:
     """
     Recursively traverses HDF5 group and populates Zarr group.
     """
     copy_attributes(h5_group, zarr_group)
-
     for name, obj in h5_group.items():
         if isinstance(obj, h5py.Dataset):
-            process_dataset(name, obj, zarr_group, **kwargs)
+            process_dataset(name, obj, zarr_group, config)
         elif isinstance(obj, h5py.Group):
             lggr.debug(f"Processing HDF5 group: '{h5_group.name}'")
             sub_group = zarr_group.create_group(name)
-            process_group(obj, sub_group, **kwargs)
+            process_group(obj, sub_group, config)
 
 
-def convert_h5_to_zarr(h5_uri: str, cli: argparse.Namespace):
+def convert_h5_to_zarr(h5_uri: str, config: argparse.Namespace) -> tuple[str, bool]:
     """
-    Orchestrates the conversion of a single HDF5 file to a Zarr store.
+    Modified to explicitly return the source URI and a success boolean to inform the Dask Scheduler.
     """
-    # Extract filename depending on protocol...
     filename = Path(h5_uri).name
     store_name = Path(filename).with_suffix(".zarr").name
-    if cli.output_uri.startswith("s3://"):
-        # Strip any existing trailing slash, then safely add exactly one...
-        zarr_store_uri = f"{cli.output_uri.rstrip('/')}/{store_name}"
+
+    if config.output_uri.startswith("s3://"):
+        zarr_store_uri = f"{config.output_uri.rstrip('/')}/{store_name}"
         iostore = get_io_store(zarr_store_uri)
         del_s3_zstore(iostore)
     else:
-        zarr_store_uri = Path(cli.output_uri).resolve() / store_name
+        zarr_store_uri = Path(config.output_uri).resolve() / store_name
         if zarr_store_uri.exists():
             if zarr_store_uri.is_file():
                 lggr.warning(f"File '{zarr_store_uri}' exists, removing")
@@ -346,49 +432,150 @@ def convert_h5_to_zarr(h5_uri: str, cli: argparse.Namespace):
         zarr_store_uri = str(zarr_store_uri)
         iostore = get_io_store(zarr_store_uri)
 
-    lggr.info(f"Converting '{h5_uri}' to '{zarr_store_uri}'")
+    lggr.info(
+        f"Worker converting '{h5_uri}' to '{zarr_store_uri}' (Zarr v{config.zarr_version})"
+    )
     try:
         with get_h5_handle(h5_uri) as h5_file:
             zstore = ObjectStore(iostore)
-            root = zarr.open_group(store=zstore, mode="w", zarr_format=3)
-            process_group(h5_file, root, use_shards=cli.use_shards)
-
-        lggr.info(f"Successfully converted: '{zarr_store_uri}'")
-
-        if cli.consolidate_metadata:
-            lggr.info(f"Consolidating metadata for '{zarr_store_uri}")
-            zarr.consolidate_metadata(store=zstore)
-    except Exception:
-        lggr.exception(f"Failed to convert '{h5_uri}'")
-        if zarr_store_uri.startswith("s3://"):
-            lggr.warning(
-                f"Due to above error, removing S3 objects related to Zarr store: '{zarr_store_uri}'"
+            root = zarr.open_group(
+                store=zstore, mode="w", zarr_format=config.zarr_version
             )
+            process_group(h5_file, root, config)
+
+        if config.consolidate_metadata:
+            lggr.info(f"Consolidating metadata for '{zarr_store_uri}'")
+            zarr.consolidate_metadata(store=zstore)
+
+        lggr.info(f"Worker finished translating: '{zarr_store_uri}'")
+        return h5_uri, True  # send strict confirmation to the Dask coordinator
+
+    except Exception:
+        lggr.exception(f"Worker failed to convert '{h5_uri}'")
+        if zarr_store_uri.startswith("s3://"):
             del_s3_zstore(iostore)
         else:
-            lggr.warning(f"Due to above error, removing '{zarr_store_uri}'")
             shutil.rmtree(zarr_store_uri)
+        return h5_uri, False  # inform coordinator that task was not accomplished
 
 
 def main():
-    cli = parse_cli()
+    # Parse raw CLI arguments...
+    raw_cli = parse_cli()
+    if raw_cli.workers > os.cpu_count():
+        raise ValueError(
+            f"Too many Dask workers requested for this computer, max = {os.cpu_count()}"
+        )
 
-    lggr.setLevel(getattr(logging, cli.loglevel.upper()))
+    # Merge with TOML and enforce override rules...
+    try:
+        config = load_and_merge_config(raw_cli)
+    except Exception as e:
+        lggr.critical(f"Configuration Error: {e}")
+        sys.exit(1)
+
+    lggr.setLevel(getattr(logging, config.loglevel.upper()))
 
     try:
-        files = get_file_list(cli.input_uri)
+        files = get_file_list(config.input_uri)
     except Exception as e:
         lggr.critical(f"Error listing files with fsspec: {e}")
         sys.exit(1)
 
     if not files:
-        lggr.warning(f"No HDF5 files found in '{cli.input_uri}'.")
+        lggr.warning(f"No HDF5 files found in '{config.input_uri}'.")
         sys.exit(0)
 
-    for f in files:
-        convert_h5_to_zarr(f, cli)
+    # Handle dry run and exit...
+    if config.dry_run:
+        lggr.info("DRY RUN ENABLED. No files will be modified or converted.")
 
-    lggr.info("All processing complete.")
+    for f in files:
+        if config.dry_run:
+            filename = Path(f).resolve()
+            store_name = filename.with_suffix(".zarr").name
+            if config.output_uri.startswith("s3://"):
+                zarr_store_uri = f"{config.output_uri.rstrip('/')}/{store_name}"
+            else:
+                zarr_store_uri = str(Path(config.output_uri).resolve() / store_name)
+            lggr.info(
+                f"[DRY RUN] Would convert '{str(filename)}' to '{zarr_store_uri}' (Zarr v{config.zarr_version})"
+            )
+        lggr.info("Dry run complete. Exiting before cluster initialization.")
+        sys.exit(0)
+
+    lggr.info(
+        f"Initializing Dask cluster with {config.workers} distinct workers (1 process per worker, NO threads)..."
+    )
+
+    MAX_RETRIES = 3
+    retry_counts = {f: 0 for f in files}
+    failed_files = []
+
+    with LocalCluster(
+        n_workers=config.workers, threads_per_worker=1, processes=True
+    ) as cluster:
+        with Client(cluster) as client:
+            # Seed the cluster with the initial batch of file tasks
+            future_to_file = {
+                client.submit(convert_h5_to_zarr, f, config): f for f in files
+            }
+
+            # Create a dynamic queue iterator that listens for completed worker responses
+            seq = as_completed(future_to_file.keys())
+
+            for future in seq:
+                f = future_to_file[future]
+
+                try:
+                    # Capture the strict confirmation tuple from the worker
+                    h5_uri, success = future.result()
+
+                    if success:
+                        lggr.info(
+                            f"[SUCCESS CONFIRMED] '{h5_uri}' has been safely converted."
+                        )
+                    else:
+                        retry_counts[f] += 1
+                        if retry_counts[f] <= MAX_RETRIES:
+                            lggr.warning(
+                                f"[WORKER FAILED] Task failed internally for '{f}'. Retry {retry_counts[f]}/{MAX_RETRIES}. Resubmitting..."
+                            )
+                            new_future = client.submit(convert_h5_to_zarr, f, config)
+                            future_to_file[new_future] = f
+                            seq.add(new_future)
+                        else:
+                            lggr.error(
+                                f"[PERMANENT FAILURE] '{f}' failed {MAX_RETRIES} times. Skipping file."
+                            )
+                            failed_files.append(f)
+
+                except Exception as e:
+                    # In case the worker crashes before even returning the False flag
+                    retry_counts[f] += 1
+                    if retry_counts[f] <= MAX_RETRIES:
+                        lggr.error(
+                            f"[WORKER CRASH] Unhandled exception processing '{f}': {e}. Retry {retry_counts[f]}/{MAX_RETRIES}. Resubmitting..."
+                        )
+                        new_future = client.submit(convert_h5_to_zarr, f, config)
+                        future_to_file[new_future] = f
+                        seq.add(new_future)
+                    else:
+                        lggr.error(
+                            f"[PERMANENT FAILURE] '{f}' crashed {MAX_RETRIES} times. Skipping file."
+                        )
+                        failed_files.append(f)
+
+    # Final summary readout
+    lggr.info("All pipeline tasks complete.")
+    if failed_files:
+        lggr.critical(
+            f"WARNING: {len(failed_files)} files permanently failed to convert after {MAX_RETRIES} retries:"
+        )
+        for failed_f in failed_files:
+            lggr.critical(f"  - {failed_f}")
+    else:
+        lggr.info("All files converted successfully.")
 
 
 if __name__ == "__main__":

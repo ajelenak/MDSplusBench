@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Configuration Schema",
+  "description": "Validation schema for H5-To-Zarr TOML configuration.",
+  "type": "object",
+  "properties": {
+    "paths": {
+      "type": "object",
+      "properties": {
+        "input_uri": {
+          "$ref": "#/$defs/overrideable_uri"
+        },
+        "output_uri": {
+          "$ref": "#/$defs/overrideable_uri"
+        }
+      },
+      "required": [
+        "input_uri",
+        "output_uri"
+      ],
+      "additionalProperties": false
+    },
+    "zarr": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "$ref": "#/$defs/overrideable_integer"
+        },
+        "use_shards": {
+          "$ref": "#/$defs/overrideable_boolean"
+        },
+        "consolidate_metadata": {
+          "$ref": "#/$defs/overrideable_boolean"
+        }
+      },
+      "required": [
+        "version",
+        "use_shards",
+        "consolidate_metadata"
+      ],
+      "additionalProperties": false
+    },
+    "logging": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "debug",
+                "info",
+                "warning",
+                "error",
+                "critical"
+              ]
+            },
+            "allow_override": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "value",
+            "allow_override"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "level"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "paths",
+    "zarr",
+    "logging"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "overrideable_uri": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string",
+          "format": "uri"
+        },
+        "allow_override": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "value",
+        "allow_override"
+      ],
+      "additionalProperties": false
+    },
+    "overrideable_integer": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "integer"
+        },
+        "allow_override": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "value",
+        "allow_override"
+      ],
+      "additionalProperties": false
+    },
+    "overrideable_boolean": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "boolean"
+        },
+        "allow_override": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "value",
+        "allow_override"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
