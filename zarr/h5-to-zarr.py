@@ -94,7 +94,7 @@ def parse_cli() -> argparse.Namespace:
 
 def load_and_merge_config(cli_args: argparse.Namespace) -> argparse.Namespace:
     """Reads TOML, applies permitted CLI overrides, and returns a unified config namespace."""
-    lggr.info(f"Reading configuratin from '{cli_args.config}'")
+    lggr.info(f"Reading configuration from '{cli_args.config}'")
     with open(cli_args.config, "rb") as f:
         toml_data = tomllib.load(f)
 
