@@ -490,9 +490,7 @@ def main():
     # Handle dry run and exit...
     if config.dry_run:
         lggr.info("DRY RUN ENABLED. No files will be modified or converted.")
-
-    for f in files:
-        if config.dry_run:
+        for f in files:
             filename = Path(f).resolve()
             store_name = filename.with_suffix(".zarr").name
             if config.output_uri.startswith("s3://"):
