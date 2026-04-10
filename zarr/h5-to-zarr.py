@@ -147,7 +147,7 @@ def get_file_list(uri: str) -> list[str]:
     Returns a list of HDF5 files to process using fsspec.
     Handles both local paths and s3:// URIs transparently.
     """
-    lggr.info(f"Listing files in: '{uri}'")
+    lggr.info(f"Looking for files in: '{uri}'")
 
     # fsspec.url_to_fs determines the protocol (file, s3, etc.) and returns the
     # filesystem object...
@@ -502,7 +502,7 @@ def main():
             lggr.info(
                 f"[DRY RUN] Would convert '{str(filename)}' to '{zarr_store_uri}' (Zarr v{config.zarr_version})"
             )
-        lggr.info("Dry run complete. Exiting before cluster initialization.")
+        lggr.info("Dry run complete. Exiting before Dask cluster initialization.")
         sys.exit(0)
 
     lggr.info(
