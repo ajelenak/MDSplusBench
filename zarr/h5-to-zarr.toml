@@ -5,7 +5,7 @@ output_uri = { value = "s3://my-dest-bucket/zarr_outputs", allow_override = true
 [zarr]
 version = { value = 3, allow_override = false }
 use_shards = { value = true, allow_override = false }
-consolidate_metadata = { value = false, allow_override = false }
+consolidate_metadata = { value = true, allow_override = false }
 
 [logging]
 level = { value = "info", allow_override = true }
