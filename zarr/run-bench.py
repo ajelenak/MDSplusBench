@@ -16,10 +16,11 @@ import dask.config
 import numpy as np
 import obstore as obs
 import pandas as pd
-import zarr
 from dask.distributed import Client, as_completed
 from obstore.store import LocalStore, S3Store
+from s3creds import get_s3_config
 from zarr.storage import ObjectStore
+import zarr
 
 # Silence the warning globally for this script execution
 warnings.filterwarnings(
@@ -192,7 +193,7 @@ def reader(obj_id: str, obj: dict, worker: int, **zarr_kwargs) -> dict[str, floa
             if fname.startswith("s3://"):
                 bucket = fname.split("/")[2]
                 path = "/".join(fname.split("/")[3:])
-                store = ObjectStore(S3Store(bucket))
+                store = ObjectStore(S3Store(bucket, config=get_s3_config()))
                 f = zarr.open_group(store=store, path=path, mode="r", **zarr_kwargs)
             else:
                 store = ObjectStore(LocalStore(fname))
@@ -205,11 +206,17 @@ def reader(obj_id: str, obj: dict, worker: int, **zarr_kwargs) -> dict[str, floa
                 sig_dset[...]
                 num_dsets += 1
 
-                # Check for Xarray-like dimension coordinates
-                for dim_name in sig_dset.attrs.get("_ARRAY_DIMENSIONS", []):
-                    if dim_name in f:
-                        f[dim_name][...]
-                        num_dsets += 1
+                # Read all Zarr arrays listed in `_ARRAY_DIMENSIONS` (the
+                # equivalent of HDF5 dimension scales for a signal dataset). The
+                # dim coordinate arrays live in the signal's enclosing shot
+                # group -- `shots/<SHOT_ID>/<dim_name>`.
+                parts = s.split("/")
+                if "signals" in parts:
+                    shot_group = f["/".join(parts[: parts.index("signals")])]
+                    for dim_name in sig_dset.attrs.get("_ARRAY_DIMENSIONS", []):
+                        if dim_name in shot_group:
+                            shot_group[dim_name][...]
+                            num_dsets += 1
         read_times += timer.elapsed()
 
     bench_data["median-open-file-time"] = np.median(open_times)
@@ -236,7 +243,7 @@ if __name__ == "__main__":
 
     if cli.infolder.startswith("s3://"):
         bucket = cli.infolder.split("/")[2]
-        obs_store = S3Store(bucket)
+        obs_store = S3Store(bucket, config=get_s3_config())
         prefix = "/".join(cli.infolder.split("/")[3:])
         if prefix and not prefix.endswith("/"):
             prefix += "/"
@@ -276,7 +283,7 @@ if __name__ == "__main__":
             if _.startswith("s3://"):
                 bucket = _.split("/")[2]
                 path = "/".join(_.split("/")[3:])
-                store = ObjectStore(S3Store(bucket))
+                store = ObjectStore(S3Store(bucket, config=get_s3_config()))
                 root = zarr.open_group(store=store, path=path, mode="r", **zarr_kwargs)
             else:
                 store = ObjectStore(LocalStore(_))

@@ -1,22 +1,37 @@
 import argparse
 import json
 import logging
-import os
 import sys
 import time
 from collections import defaultdict, namedtuple
-from configparser import ConfigParser
 from dataclasses import dataclass, field
-from itertools import batched, product
+from itertools import product
 from multiprocessing import cpu_count
 from pathlib import Path
-import fsspec
+from time import sleep
 from typing import Generator, Union
 
+import dask.config
+import fsspec
 import h5py
 import numpy as np
 import pandas as pd
-from dask.distributed import Client
+from dask.distributed import Client, as_completed
+
+if h5py.version.hdf5_version_tuple < (2, 0, 0):
+    raise RuntimeError("Must use libhdf5 2.0.0 or later")
+if not h5py.h5.get_config().ros3:
+    raise RuntimeError("Must use libhdf5 built with ros3 driver")
+
+# Increase timeout defaults to avoid scheduler-worker comms issues...
+dask.config.set(
+    {
+        "distributed.comm.timeouts.connect": "120s",
+        "distributed.comm.timeouts.tcp": "120s",
+        "distributed.scheduler.worker-ttl": "120s",
+        "distributed.comm.retry.count": 15,
+    }
+)
 
 lggr = logging.getLogger("mdsplusml-bench")
 
@@ -75,39 +90,6 @@ class Timer:
         self.stop()
 
 
-def get_s3_params(need_region: bool = False) -> dict[str, bytes]:
-    """Collect S3 connection parameters."""
-    s3p = dict()
-
-    # Read AWS credentials and config files...
-    home = Path.home()
-    creds = ConfigParser()
-    creds.read(
-        os.getenv("AWS_SHARED_CREDENTIALS_FILE", home.joinpath(".aws", "credentials"))
-    )
-    config = ConfigParser()
-    config.read(os.getenv("AWS_CONFIG_FILE", home.joinpath(".aws", "config")))
-
-    profile = os.getenv("AWS_PROFILE", "default")
-    s3p["secret_id"] = os.getenv(
-        "AWS_ACCESS_KEY_ID", creds.get(profile, "aws_access_key_id", fallback="")
-    ).encode("ascii")
-    s3p["secret_key"] = os.getenv(
-        "AWS_SECRET_ACCESS_KEY",
-        creds.get(profile, "aws_secret_access_key", fallback=""),
-    ).encode("ascii")
-    s3p["session_token"] = os.getenv(
-        "AWS_SESSION_TOKEN",
-        creds.get(profile, "aws_session_token", fallback=""),
-    ).encode("ascii")
-    if need_region:
-        s3p["aws_region"] = os.getenv(
-            "AWS_REGION", config.get(profile, "region")
-        ).encode("ascii")
-
-    return s3p
-
-
 def parse_cli() -> argparse.Namespace:
     """Process command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -120,13 +102,33 @@ def parse_cli() -> argparse.Namespace:
         type=str,
         metavar="FOLDER",
     )
-    # parser.add_argument(
-    #     "--pb",
-    #     help="Page buffer size in bytes. Multiple values allowed.",
-    #     nargs="+",
-    #     type=int,
-    #     default=[0],
-    # )
+    parser.add_argument(
+        "--read",
+        help="What data to read from the files",
+        type=str,
+        nargs="+",
+        choices=["shots", "signals"],
+        default=["shots", "signals"],
+    )
+    parser.add_argument(
+        "--page-cache",
+        help="File page cache size in bytes. Multiple values allowed.",
+        nargs="+",
+        type=int,
+        default=[256 * MiB],
+    )
+    parser.add_argument(
+        "--min-workers",
+        help="Minimal number of Dask workers",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--max-workers",
+        help="Maximum number of Dask workers",
+        type=int,
+        default=180,
+    )
     parser.add_argument(
         "--to-csv",
         help="Save benchmark data to a CSV file",
@@ -148,6 +150,20 @@ def bench_params(**kwargs) -> Generator:
     """Return a tuple of namedtuples with benchmark runtime parameters."""
     BenchParams = namedtuple("BenchParams", kwargs.keys())
     return (BenchParams(*_) for _ in product(*kwargs.values()))
+
+
+def batch_tasks(num_batches: int, lst: list[dict], mode: str = "equal_effort"):
+    """Divvy up items in batches based on the mode. Two modes possible:
+    `equal_effort` and `round_robin`."""
+    if num_batches <= 0:
+        raise ValueError(f"Invalid value for number of batches: {num_batches}")
+    actual_batches = min(num_batches, len(lst))
+    if mode == "round_robin":
+        return [lst[i::actual_batches] for i in range(actual_batches)]
+    elif mode == "equal_effort":
+        chunk_size = (len(lst) + actual_batches - 1) // actual_batches
+        return [lst[i : i + chunk_size] for i in range(0, len(lst), chunk_size)]
+    raise ValueError(f'Unknown mode: "{mode}"')
 
 
 def gather_dset_info(h5f: h5py.File) -> dict[int, dict[str, Union[str, list[str]]]]:
@@ -173,23 +189,27 @@ def gather_dset_info(h5f: h5py.File) -> dict[int, dict[str, Union[str, list[str]
 
 def reader(obj_id: str, obj: dict, worker: int, **h5f_kwargs) -> dict[str, float]:
     """Read data for supplied selection of shots/signals in the given HDF5 file(s)."""
-    h5py._errors.unsilence_errors()  # enable displaying full libhdf5 error stack
+    # h5py._errors.unsilence_errors()  # enable displaying full libhdf5 error stack
     bench_data = dict()
-    # with Timer("open-file-time") as timer:
-    #     f = h5py.File(h5file, mode="r", **h5f_kwargs)
-    # bench_data[timer.name] = timer.elapsed()
-    num_dsets = 0
-    with Timer("open+read-data-time") as timer:
-        for fname, signals in obj.items():
-            with h5py.File(fname, mode="r", **h5f_kwargs) as f:
-                for s in signals:
-                    sig_dset = f[s]
-                    sig_dset[...]
-                    num_dsets += 1
-                    for dim in sig_dset.dims:
-                        for scale in dim.values():
-                            scale[...]
-                            num_dsets += 1
+    open_times = list()
+    read_times = 0
+    num_files = num_dsets = 0
+    for fname, signals in obj.items():
+        with Timer("open-file-time") as timer:
+            f = h5py.File(fname, mode="r", **h5f_kwargs)
+            num_files += 1
+        open_times.append(timer.elapsed())
+        with Timer("read-data-time") as timer:
+            for s in signals:
+                sig_dset = f[s]
+                sig_dset[...]
+                num_dsets += 1
+                for dim in sig_dset.dims:
+                    for scale in dim.values():
+                        scale[...]
+                        num_dsets += 1
+        read_times += timer.elapsed()
+        f.close()
 
     # Collect page buffer cache stats only for a paged file...
     # if (
@@ -209,13 +229,15 @@ def reader(obj_id: str, obj: dict, worker: int, **h5f_kwargs) -> dict[str, float
     #         bench_data["pb-raw-hitrate"] = hit_rate(pb_stats.raw)
     #         bench_data["pb-raw-evicts"] = pb_stats.raw.evictions
 
+    bench_data["median-open-file-time"] = np.median(open_times)
+    bench_data["num-open-files"] = num_files
     bench_data["worker#"] = worker
     bench_data["obj-id"] = obj_id
-    bench_data[timer.name] = timer.elapsed()
-    bench_data["wrkr-num-objs"] = len(obj)
-    bench_data["mean-obj-time"] = timer.elapsed() / len(obj)
+    bench_data["read-data-time"] = read_times
+    bench_data["num-objs"] = len(obj)
+    # bench_data["mean-obj-time"] = timer.elapsed() / len(obj)
     bench_data["num-dsets"] = num_dsets
-    bench_data["mean-dset-time"] = timer.elapsed() / num_dsets
+    # bench_data["mean-dset-time"] = timer.elapsed() / num_dsets
     bench_data["pb-size"] = h5f_kwargs["page_buf_size"]
     return bench_data
 
@@ -233,10 +255,8 @@ if __name__ == "__main__":
 
     if cli.infolder.startswith("s3://"):
         fs = fsspec.filesystem("s3")
-        pb_size = [256 * MiB]  # page buffer cache sizes
     else:
         fs = fsspec.filesystem("file")
-        pb_size = [0, 256 * MiB]  # page buffer cache sizes
     shot_files = sorted(fs.glob(cli.infolder + "/*.hdf5"))
     lggr.info("Found %d shot files at %s", len(shot_files), cli.infolder)
     if len(shot_files) == 0:
@@ -245,12 +265,11 @@ if __name__ == "__main__":
         lggr.debug("List of shot files: %r", shot_files)
 
     cpus = cpu_count()
-    lggr.debug("%d CPUs reported for the system", cpus)
+    lggr.debug("The number of CPUs reported: %d", cpus)
 
     # Figure out h5py file open settings...
     if "s3" in fs.protocol:
         h5py_kwargs = {"driver": "ros3", "page_buf_size": 64 * MiB}
-        h5py_kwargs.update(get_s3_params(need_region=True))
 
         # fs.glob() output currently does not have the s3 schema part so add it here...
         shot_files = ["s3://" + _ for _ in shot_files]
@@ -270,19 +289,48 @@ if __name__ == "__main__":
 
     # Re-arrange per-shot info into per-signal...
     signals = defaultdict(list)
-    # for s in chain.from_iterable(all_shots_info.values()):
     for _ in shots.values():
         fname = _["fname"]
         for s in _["h5path"]:
             name_parts = Path(s).parts
-            if "signals" in name_parts:  # "signals" must be in the HDF5 path
-                signals[name_parts[-1]].append({"h5path": s, "fname": fname})
+            try:
+                # "signals" must be in the HDF5 path
+                signals_index = name_parts.index("signals")
+            except ValueError:
+                continue
+
+            # For signal identifier across files use only its latter part of the
+            # HDF5 dataset's path without the shot number.
+            signals["/".join(name_parts[slice(signals_index + 1, None)])].append(
+                {"h5path": s, "fname": fname}
+            )
 
     # Run the benchmarks with different parameters...
-    data = list()
+    bench_data = list()
+    prev_num_workers = {"shots": -1, "signals": -1}
     for rp in bench_params(
-        pb_size=pb_size,  # libhdf5 page buffer size
-        num_workers=[1, 2, 4, 8, 16, 24, 32, 48, 64],  # number of Dask workers
+        pb_size=cli.page_cache,
+        num_workers=[  # number of Dask workers
+            1,
+            2,
+            4,
+            6,
+            8,
+            12,
+            16,
+            24,
+            32,
+            40,
+            48,
+            64,
+            80,
+            96,
+            112,
+            128,
+            140,
+            160,
+            180,
+        ],
         shots=[None, 0],  # number of shots to read (0 means all)
         signals=[None, 0],  # number of signals to read (0 means all)
     ):
@@ -292,6 +340,14 @@ if __name__ == "__main__":
         ):
             continue
         lggr.info("Benchmark run parameters: %s", rp)
+        if not (cli.min_workers <= rp.num_workers <= cli.max_workers):
+            lggr.info(
+                "Skipping this benchmark, number of workers %d outside specified range [%d, %d]",
+                rp.num_workers,
+                cli.min_workers,
+                cli.max_workers,
+            )
+            continue
         if rp.num_workers > cpus:
             lggr.warning(
                 "Number of workers %d greater than reported CPUs %d",
@@ -305,62 +361,102 @@ if __name__ == "__main__":
         if rp.shots is None and rp.signals is not None:
             objs = signals
             obj_type = "signals"
-            lggr.debug("Will read shot files by signal")
-            if rp.num_workers < 8:
-                lggr.info(
-                    "Skipping this benchmark, too little workers: %d", rp.num_workers
-                )
-                continue
         else:
             objs = shots
             obj_type = "shots"
-            lggr.debug("Will read shot files by shot")
+
+        if obj_type not in cli.read:
+            lggr.info("Skipping since reading of %s not requested", obj_type)
+            continue
 
         # Randomize and select the shots/signals to read...
         use_objs = list(objs.keys())
         np.random.shuffle(use_objs)
 
-        dask_client = Client(
-            processes=True, n_workers=rp.num_workers, threads_per_worker=1
-        )
-        bench_futures = list()
-        with Timer("total-runtime") as timer:
-            if obj_type == "shots":
-                what = objs[
-                    use_objs[0]
-                ]  # only use the first shot from the randomized list
-                lggr.info(
-                    "Reading shot #%d data with %d signals and their scales with %d worker(s)",
-                    use_objs[0],
-                    len(what["h5path"]),
-                    rp.num_workers,
+        # Run the benchmark cases...
+        if obj_type == "shots":
+            # Given the max num. workers and all the shot files, break down the
+            # work in tasks and determine actual num. workers based on the
+            # batching mode.
+            tasks = batch_tasks(rp.num_workers, use_objs, mode="equal_effort")
+            num_workers = len(tasks)
+            if num_workers == prev_num_workers[obj_type]:
+                lggr.warning(
+                    f"Actual number of workers same as previous case, skipping: {num_workers}"
                 )
-                worker = 0
-                for batch in batched(
-                    what["h5path"], (len(what["h5path"]) // rp.num_workers) + 1
-                ):
-                    worker += 1
+                continue
+            else:
+                prev_num_workers[obj_type] = num_workers
+
+            lggr.info(
+                "Reading from %d shot files with %d signals and their scales using %d worker(s)",
+                len(use_objs),
+                len(signals),
+                num_workers,
+            )
+
+            # Start Dask client and LocalCluster, wait 2 secs...
+            dask_client = Client(
+                processes=True, n_workers=num_workers, threads_per_worker=1
+            )
+            sleep(2)
+
+            worker = 1
+            with Timer("total-runtime") as timer:
+                bench_futures = list()
+                for shot_ids in tasks:
                     bf = dask_client.submit(
                         reader,
-                        str(use_objs[0]),
-                        {what["fname"]: batch},
+                        "shot files",
+                        dict((objs[_]["fname"], objs[_]["h5path"]) for _ in shot_ids),
                         worker,
                         **h5py_kwargs,
                     )
                     bench_futures.append(bf)
+                    worker += 1
 
-            elif obj_type == "signals":
-                lggr.info(
-                    "Reading %d signals and their scales from %d files with %d worker(s)",
-                    len(use_objs),
-                    len(shot_files),
-                    rp.num_workers,
+                # Collect benchmark results from the Dask workers...
+                futures_results = [_.result() for _ in as_completed(bench_futures)]
+
+        elif obj_type == "signals":
+            # Given the max num. workers and all the signals, break down the
+            # work in tasks per signal, and determine actual num. workers based
+            # on the batching mode.
+            tasks = dict()
+            num_workers = 1
+            for sig in use_objs:
+                tasks[sig] = batch_tasks(rp.num_workers, objs[sig], mode="equal_effort")
+                num_workers = max(num_workers, len(tasks[sig]))
+            if num_workers == prev_num_workers[obj_type]:
+                lggr.warning(
+                    f"Actual number of workers same as previous case, skipping: {num_workers}"
                 )
-                for sig, what in objs.items():
-                    lggr.debug("Reading signal %s data", sig)
-                    worker = 0
-                    for batch in batched(what, (len(what) // rp.num_workers) + 1):
-                        worker += 1
+                continue
+            else:
+                prev_num_workers[obj_type] = num_workers
+
+            lggr.info(
+                "Reading %d signals and their scales from %d files using %d worker(s)",
+                len(use_objs),
+                len(shot_files),
+                num_workers,
+            )
+
+            # Start Dask client and LocalCluster, wait 2 secs...
+            dask_client = Client(
+                processes=True, n_workers=num_workers, threads_per_worker=1
+            )
+            sleep(2)
+
+            with Timer("total-runtime") as timer:
+                futures_results = list()
+                for sig in tasks.keys():
+                    lggr.debug(
+                        "Reading signal %s data using %d workers", sig, num_workers
+                    )
+                    bench_futures = list()
+                    worker = 1
+                    for batch in tasks[sig]:
                         bf = dask_client.submit(
                             reader,
                             sig,
@@ -369,29 +465,35 @@ if __name__ == "__main__":
                             **h5py_kwargs,
                         )
                         bench_futures.append(bf)
+                        worker += 1
 
-            bench_data = dask_client.gather(bench_futures)
+                    # Collect benchmark results from the Dask workers...
+                    futures_results.extend(
+                        [_.result() for _ in as_completed(bench_futures)]
+                    )
 
+        sleep(2)
         dask_client.close()
+
         lggr.info("Benchmark case runtime = %.4f seconds", timer.elapsed())
-        lggr.debug("Worker benchmark results: %s", bench_data)
-        for wrkr, _ in enumerate(bench_data):
+        lggr.debug("Sample worker benchmark results: %s", futures_results[-1])
+        for _ in futures_results:
             _.update(
                 {
-                    "num-workers": rp.num_workers,
+                    "num-workers": num_workers,
                     "obj-type": obj_type,
                     "tot-num-obj": len(use_objs),
                     timer.name: timer.elapsed(),
                 }
             )
-        data.extend(bench_data)
+        bench_data.extend(futures_results)
         if cli.to_csv:
             lggr.debug("Checkpoint benchmark data so far...")
             Path(cli.to_csv).with_suffix(".checkpoint.json").write_text(
-                json.dumps(data, indent=None)
+                json.dumps(bench_data, indent=None)
             )
 
-    df = pd.DataFrame.from_records(data)
+    df = pd.DataFrame.from_records(bench_data)
     if cli.to_csv:
         lggr.info("Benchmark results saved to file: %s", cli.to_csv)
         df.to_csv(cli.to_csv, index=False)
